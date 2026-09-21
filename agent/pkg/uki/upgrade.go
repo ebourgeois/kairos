@@ -115,45 +115,114 @@ func (i *UpgradeAction) Run() (err error) {
 		return fmt.Errorf("removing artifact set: %w", err)
 	}
 
-	// add sort key to all files
-	err = AddSystemdConfSortKey(i.cfg.Fs, i.spec.EfiPartition.MountPoint, i.cfg.Logger)
+	// The rest (sort key, boot assessment, default boot entry, loader.conf
+	// key cleanup, EFI key upgrades, kairos-uki-upgrade.after stage/hook)
+	// is finalize work whose on-disk formats the target image owns. Same
+	// argument as the non-UKI path in agent/pkg/action/upgrade.go: to keep
+	// a format change from needing every previously released host agent
+	// to already understand it, we hand off to the target's own
+	// kairos-agent -- extracted here from the .initrd of the now-active
+	// signed .efi -- and fall back to running the same finalize inline
+	// when the target predates the handoff.
+	return i.runFinalizeStep()
+}
+
+// runFinalizeStep hands the UKI finalize step off to the target image's
+// kairos-agent, extracted from the .initrd section of the now-active
+// signed .efi, and falls back to running the same finalize inline for
+// targets that predate the upgrade-finalize subcommand. Preserves the
+// order the rest of Run() relied on: the caller has already dumped, ver-
+// ified, and rotated the artifacts.
+//
+// Fallback contract, mirroring the non-UKI runFinalizeStep in
+// agent/pkg/action/upgrade.go: only the setup phase (temp dir, .initrd
+// extract, marker + binary presence) is allowed to fall back to the
+// inline path. Every one of those branches runs BEFORE the extracted
+// target agent has been exec'd, so none of them has written anything to
+// the ESP yet — an inline retry is safe. Once the target agent is
+// exec'd its exit code is propagated (see the Runner.Run below) and NOT
+// retried inline, for the same reason the non-UKI side documents: if
+// the target decided the upgrade cannot proceed, honoring that decision
+// matters more than papering over it with a possibly-buggier older code
+// path, and by then the target may have already rewritten loader.conf
+// keys / boot assessment / sort keys where an inline retry would
+// double-write.
+func (i *UpgradeAction) runFinalizeStep() error {
+	ctx := i.buildFinalizeContext()
+	activeEfi := filepath.Join(constants.UkiEfiDir, "EFI", "Kairos", "active.efi")
+
+	tempDir, err := os.MkdirTemp("", "kairos-uki-finalize-*")
 	if err != nil {
-		i.cfg.Logger.Warnf("adding sort key: %s", err.Error())
+		i.cfg.Logger.Warnf("could not create temp dir for target agent extraction: %s; running finalize inline", err)
+		return RunFinalize(i.cfg, ctx)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Extract the multi-call binary at /usr/bin/kairos (invoked here under
+	// the "kairos-agent" name via argv[0] dispatch) and the capability
+	// marker in one streaming pass over the .initrd. Both need to be
+	// present for the handoff to be safe: the marker says the target's
+	// upgrade-finalize subcommand exists, the binary is what will run it.
+	extractedAgent := filepath.Join(tempDir, "kairos-agent")
+	extractedMarker := filepath.Join(tempDir, "capability-marker")
+	found, err := ExtractFromInitrd(activeEfi, map[string]string{
+		"/usr/bin/kairos": extractedAgent,
+		constants.UpgradeFinalizeCapabilityMarker: extractedMarker,
+	})
+	if err != nil {
+		i.cfg.Logger.Warnf("could not read .initrd of %s: %s; running finalize inline", activeEfi, err)
+		return RunFinalize(i.cfg, ctx)
 	}
 
-	// Add boot assessment to files by appending +3 to the name
-	err = elementalUtils.AddBootAssessment(i.cfg.Fs, i.spec.EfiPartition.MountPoint, i.cfg.Logger)
-	if err != nil {
-		i.cfg.Logger.Warnf("adding boot assesment: %s", err.Error())
+	hasAgent := containsPath(found, "/usr/bin/kairos")
+	hasMarker := containsPath(found, constants.UpgradeFinalizeCapabilityMarker)
+	if !hasAgent || !hasMarker {
+		i.cfg.Logger.Info("Target image predates the upgrade-finalize subcommand, running finalize inline")
+		return RunFinalize(i.cfg, ctx)
 	}
-	// SelectBootEntry sets the default boot entry to the selected entry
-	err = action.SelectBootEntry(i.cfg, constants.BootEntryActive)
-	// Should we fail? Or warn?
-	if err != nil {
-		i.cfg.Logger.Errorf("selecting boot entry: %s", err.Error())
-		return err
+	if err := os.Chmod(extractedAgent, 0o755); err != nil {
+		return fmt.Errorf("chmod extracted target agent: %w", err)
 	}
 
-	// Remove any default keys in the loader.conf that might cause issues
-	err = removeDefaultKeysFromLoaderConf(i.cfg.Fs, i.spec.EfiPartition.MountPoint, i.cfg.Logger)
-	if err != nil {
-		i.cfg.Logger.Warnf("removing default keys from loader.conf: %s", err.Error())
+	ctxPath := filepath.Join(tempDir, "context.json")
+	if err := action.WriteFinalizeContext(i.cfg.Fs, ctxPath, ctx); err != nil {
+		return fmt.Errorf("writing finalize context: %w", err)
 	}
 
-	// Upgrade any efi keys in the entries by the new uki key
-	err = upgradeEfiKeysInLoaderEntries(i.cfg.Arch, i.cfg.Fs, i.spec.EfiPartition.MountPoint, i.cfg.Logger)
-	if err != nil {
-		i.cfg.Logger.Warnf("upgrading efi keys in loader entries: %s", err.Error())
+	i.cfg.Logger.Infof("Handing off upgrade finalize to target kairos-agent (extracted from %s)", activeEfi)
+	out, err := i.cfg.Runner.Run(extractedAgent, "upgrade-finalize", "--context-file", ctxPath)
+	if len(out) > 0 {
+		i.cfg.Logger.Infof("upgrade-finalize output: %s", string(out))
 	}
-	if err = elementalUtils.RunStage(i.cfg, "kairos-uki-upgrade.after"); err != nil {
-		i.cfg.Logger.Errorf("running kairos-uki-upgrade.after stage: %s", err.Error())
-	}
+	return err
+}
 
-	if err = events.RunHookScript("/usr/bin/kairos-agent.uki.upgrade.after.hook"); err != nil {
-		i.cfg.Logger.Errorf("running kairos-uki-upgrade.after hook script: %s", err.Error())
+// buildFinalizeContext packs the fields uki.RunFinalize (and the target's
+// upgrade-finalize subcommand) need out of the spec into a serializable
+// FinalizeContext.
+func (i *UpgradeAction) buildFinalizeContext() action.FinalizeContext {
+	return action.FinalizeContext{
+		Mode:            action.UpgradeModeUki,
+		Arch:            i.cfg.Arch,
+		RecoveryUpgrade: i.spec.RecoveryUpgrade(),
+		UkiEntry:        i.spec.Entry,
+		EFIPartition: &action.SerializedPartition{
+			Path:            i.spec.EfiPartition.Path,
+			Name:            i.spec.EfiPartition.Name,
+			MountPoint:      i.spec.EfiPartition.MountPoint,
+			FS:              i.spec.EfiPartition.FS,
+			FilesystemLabel: i.spec.EfiPartition.FilesystemLabel,
+		},
 	}
+}
 
-	return nil
+func containsPath(paths []string, want string) bool {
+	for _, p := range paths {
+		if p == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (i *UpgradeAction) installEntry(entry string) error {

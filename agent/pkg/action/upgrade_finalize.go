@@ -1,19 +1,3 @@
-/*
-Copyright © 2026 SUSE LLC
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package action
 
 import (
@@ -31,28 +15,56 @@ import (
 	sdkPartitions "github.com/kairos-io/kairos/v4/sdk/types/partitions"
 )
 
+// UpgradeMode discriminates finalize dispatch: "grub" is the non-UKI /
+// non-Kubernetes path (chroot handoff into the deployed rootfs), "uki" is
+// the trusted-boot path (agent binary extracted from the signed .efi's
+// .initrd section, no chroot). The zero value defaults to "grub" so a
+// context written by an older host still deserializes to the historical
+// behavior.
+type UpgradeMode string
+
+const (
+	UpgradeModeGrub UpgradeMode = "grub"
+	UpgradeModeUki  UpgradeMode = "uki"
+)
+
 // FinalizeContext carries the inputs the upgrade finalize step needs.
 //
 // Paths in the struct are always resolved as the caller sees them. When
 // RunFinalize runs as a fallback on the host, they are host paths. When it
-// runs inside the target rootfs via the upgrade-finalize subcommand, the
-// host filesystem is bind-mounted at /host, ImgMountPoint is "/", and every
-// path that describes host state (transition image, state / recovery / OEM
-// / persistent mount points, EFI partition) carries the /host prefix.
+// runs inside the target rootfs via the upgrade-finalize subcommand
+// (grub mode), the host filesystem is bind-mounted at /host,
+// ImgMountPoint is "/", and every path that describes host state
+// (transition image, state / recovery / OEM / persistent mount points,
+// EFI partition) carries the /host prefix. In uki mode the target agent
+// runs directly on the host filesystem (no chroot, the binary is
+// extracted from the .initrd of the signed .efi) so paths are just the
+// host's real ones; only the UKI-specific fields (EFI partition, entry,
+// arch) are consulted.
 type FinalizeContext struct {
-	ImgMountPoint        string               `json:"imgMountPoint"`
-	TransitionImgFile    string               `json:"transitionImgFile"`
-	TransitionImgFS      string               `json:"transitionImgFS"`
-	RecoveryUpgrade      bool                 `json:"recoveryUpgrade"`
+	// Mode selects the finalize dispatch. Empty is treated as "grub" for
+	// backward compatibility with contexts written before UKI support.
+	Mode UpgradeMode `json:"mode,omitempty"`
+
+	// --- grub-mode fields ---------------------------------------------------
+	ImgMountPoint        string               `json:"imgMountPoint,omitempty"`
+	TransitionImgFile    string               `json:"transitionImgFile,omitempty"`
+	TransitionImgFS      string               `json:"transitionImgFS,omitempty"`
+	RecoveryUpgrade      bool                 `json:"recoveryUpgrade,omitempty"`
 	GrubDefEntry         string               `json:"grubDefEntry,omitempty"`
 	ExtraDirsRootfs      []string             `json:"extraDirsRootfs,omitempty"`
-	StateMountPoint      string               `json:"stateMountPoint"`
+	StateMountPoint      string               `json:"stateMountPoint,omitempty"`
 	StateFSLabel         string               `json:"stateFSLabel,omitempty"`
 	ActiveImgFile        string               `json:"activeImgFile,omitempty"`
 	OEMMountPoint        string               `json:"oemMountPoint,omitempty"`
 	PersistentMountPoint string               `json:"persistentMountPoint,omitempty"`
 	EFIPartition         *SerializedPartition `json:"efiPartition,omitempty"`
 	Arch                 string               `json:"arch,omitempty"`
+
+	// --- uki-mode fields ----------------------------------------------------
+	// UkiEntry is set on single-entry upgrades ("kairos-agent upgrade
+	// --boot-entry <name>"). Empty means an active/passive rotation.
+	UkiEntry string `json:"ukiEntry,omitempty"`
 }
 
 // SerializedPartition is the JSON-friendly subset of sdkPartitions.Partition
